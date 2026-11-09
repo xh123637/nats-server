@@ -41,6 +41,7 @@ import (
 
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
 )
 
@@ -12871,4 +12872,90 @@ func TestJetStreamClusterR1StreamWriteErrFailsHealthz(t *testing.T) {
 	hs := sl.healthz(nil)
 	require_Equal(t, hs.StatusCode, 503)
 	require_Contains(t, hs.Error, "'$G > TEST'", "stream write error", "mock write error")
+}
+
+// applyStreamMsgOp checked the stream's inflight maps for nil without
+// holding clMu, while batchStagedDiff.commit allocates them under clMu.
+// Run with -race.
+func TestJetStreamClusterApplyInflightMapsRace(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	const streams = 6
+	js := make([]jetstream.JetStream, len(c.servers))
+	for i, s := range c.servers {
+		nc, j := jsClientConnectNewAPI(t, s)
+		defer nc.Close()
+		js[i] = j
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for n := range streams {
+		name, prefix := fmt.Sprintf("RACE%d", n), fmt.Sprintf("race%d", n)
+		cfg := jetstream.StreamConfig{Name: name, Subjects: []string{prefix + ".>"}, Replicas: 3}
+		if _, err := js[0].CreateStream(context.Background(), cfg); err != nil {
+			t.Fatalf("create stream: %v", err)
+		}
+		c.waitOnStreamLeader(globalAccountName, name)
+
+		// Keep the leaders' apply loops busy.
+		for i := range js {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for k := 0; ctx.Err() == nil; k++ {
+					_, _ = js[i].PublishAsync(fmt.Sprintf("%s.flood.%d.%d", prefix, i, k%64), []byte("x"))
+					if js[i].PublishAsyncPending() > 2000 {
+						select {
+						case <-js[i].PublishAsyncComplete():
+						case <-ctx.Done():
+						case <-time.After(time.Second):
+						}
+					}
+				}
+			}()
+		}
+
+		// Step the leader down (now and then scale 3 -> 2 -> 3), and once a new leader is up
+		// send a few expected-last-subject-sequence publishes: the first one of the term
+		// allocates mset.expectedPerSubjectSequence in batchStagedDiff.commit.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := 0; ctx.Err() == nil; k++ {
+				if k%5 == 4 {
+					ucfg := cfg
+					if k%10 == 4 {
+						ucfg.Replicas = 2
+					}
+					uctx, ucancel := context.WithTimeout(ctx, 5*time.Second)
+					_, _ = js[k%len(js)].UpdateStream(uctx, ucfg)
+					ucancel()
+				} else if s := c.streamLeader(globalAccountName, name); s != nil {
+					_ = s.JetStreamStepdownStream(globalAccountName, name)
+				}
+				var leader int = -1
+				for deadline := time.Now().Add(2 * time.Second); leader < 0 && time.Now().Before(deadline) && ctx.Err() == nil; {
+					for i, s := range c.servers {
+						if s.JetStreamIsStreamLeader(globalAccountName, name) {
+							leader = i
+						}
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				if leader < 0 {
+					continue
+				}
+				time.Sleep(20 * time.Millisecond)
+				for j := range 4 {
+					_, _ = js[leader].PublishAsync(fmt.Sprintf("%s.fresh.%d.%d", prefix, k, j), nil,
+						jetstream.WithExpectLastSequencePerSubject(0))
+				}
+				time.Sleep(30 * time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
 }

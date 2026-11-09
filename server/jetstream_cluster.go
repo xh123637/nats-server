@@ -6237,23 +6237,22 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 	// Process the actual message here.
 	err = mset.processJetStreamMsg(subject, reply, hdr, msg, lseq, ts, mt, sourced, needIsolation)
 
+	// The inflight maps are allocated under clMu by batchStagedDiff.commit,
+	// so the nil checks need clMu as well.
+	mset.clMu.Lock()
+
 	// Take into account subject transforms, if any.
 	// The untransformed subject is replicated, but the transformed subject is used for consistency checks below.
 	csubject := subject
 	if mset.inflightTransform != nil {
-		mset.clMu.Lock()
 		if subj, found := mset.inflightTransform[lseq]; found {
 			csubject = subj
 			delete(mset.inflightTransform, lseq)
 		}
-		mset.clMu.Unlock()
 	}
 
 	// If we have inflight make sure to clear after processing.
-	// TODO(dlc) - technically check on inflight != nil could cause datarace.
-	// But do not want to acquire lock since tracking this will be rare.
 	if mset.inflight != nil {
-		mset.clMu.Lock()
 		if i, found := mset.inflight[csubject]; found {
 			// Decrement from pending operations. Once it reaches zero, it can be deleted.
 			if i.ops > 0 {
@@ -6274,12 +6273,10 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 				delete(mset.inflight, csubject)
 			}
 		}
-		mset.clMu.Unlock()
 	}
 
 	// Update running total for counter.
 	if mset.clusteredCounterTotal != nil {
-		mset.clMu.Lock()
 		if counter, found := mset.clusteredCounterTotal[csubject]; found {
 			// Decrement from pending operations. Once it reaches zero, it can be deleted.
 			if counter.ops > 0 {
@@ -6289,18 +6286,16 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 				delete(mset.clusteredCounterTotal, csubject)
 			}
 		}
-		mset.clMu.Unlock()
 	}
 
 	// Clear expected per subject state after processing.
 	if mset.expectedPerSubjectSequence != nil {
-		mset.clMu.Lock()
 		if subj, found := mset.expectedPerSubjectSequence[lseq]; found {
 			delete(mset.expectedPerSubjectSequence, lseq)
 			delete(mset.expectedPerSubjectInProcess, subj)
 		}
-		mset.clMu.Unlock()
 	}
+	mset.clMu.Unlock()
 
 	if err != nil {
 		if err == errLastSeqMismatch {
